@@ -1,0 +1,62 @@
+;
+; scsi_filter.inf
+;
+
+[Version]
+Signature="$WINDOWS NT$"
+Class=SCSIAdapter
+ClassGuid={4d36e97b-e325-11ce-bfc1-08002be10318}
+Provider=%ManufacturerName%
+CatalogFile=scsi_filter.cat
+DriverVer=
+PnpLockDown=1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+scsi_filter.sys = 1,,
+
+;*****************************************
+; Install Section
+;*****************************************
+
+[Manufacturer]
+%ManufacturerName%=Standard,NT$ARCH$.10.0...16299 ; %13% support introduced in build 16299
+
+[Standard.NT$ARCH$.10.0...16299]
+%scsi_filter.DeviceDesc%=scsi_filter_Device, SCSI\*
+
+[scsi_filter_Device.NT]
+CopyFiles=File_Copy
+
+[File_Copy]
+scsi_filter.sys
+
+[scsi_filter_Device.NT.HW]
+AddReg=scsi_filter_AddReg
+
+[scsi_filter_AddReg]
+HKR,,UpperFilters,0x00010008,scsi_filter
+
+;-------------- Service installation
+[scsi_filter_Device.NT.Services]
+AddService = scsi_filter,%SPSVCINST_ASSOCSERVICE%, scsi_filter_Service_Inst
+
+; -------------- scsi_filter driver install sections
+[scsi_filter_Service_Inst]
+DisplayName    = %scsi_filter.SVCDESC%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 1               ; SERVICE_SYSTEM_START (for filter drivers)
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %13%\scsi_filter.sys
+
+[Strings]
+SPSVCINST_ASSOCSERVICE= 0x00000002
+ManufacturerName="SCSI Filter Driver Provider"
+DiskName = "scsi_filter Installation Disk"
+scsi_filter.DeviceDesc = "SCSI Filter Driver"
+scsi_filter.SVCDESC = "SCSI Filter Service"
