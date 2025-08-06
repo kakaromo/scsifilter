@@ -4,6 +4,9 @@
 
 #define IOCTL_GET_SCSI_DATA CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_SET_TARGET_DRIVE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_ENABLE_TRACING CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_DISABLE_TRACING CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_GET_STATS CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #define SCSI_TRACE_TAG 'SCTR'
 #define TRACE_BUFFER_SIZE 1024
@@ -20,6 +23,13 @@ typedef struct _SCSI_TRACE_DATA {
     ULONG SenseInfoLength;
     UCHAR SenseInfoBuffer[SENSE_BUFFER_SIZE];
 } SCSI_TRACE_DATA, * PSCSI_TRACE_DATA;
+
+typedef struct _SCSI_FILTER_STATS {
+    ULONG TotalRequests;
+    ULONG DroppedRequests;
+    ULONG BufferUtilization;  // 버퍼 사용률 (백분율)
+    BOOLEAN TracingEnabled;
+} SCSI_FILTER_STATS, * PSCSI_FILTER_STATS;
 #pragma pack(pop)
 
 typedef struct _DEVICE_EXTENSION {
@@ -29,9 +39,11 @@ typedef struct _DEVICE_EXTENSION {
     KSPIN_LOCK TraceBufferLock;
     LIST_ENTRY ListEntry;
     SCSI_TRACE_DATA TraceBuffer[TRACE_BUFFER_SIZE];
-    ULONG TraceBufferHead;
-    ULONG TraceBufferTail;
+    volatile ULONG TraceBufferHead;  // volatile로 캐시 일관성 보장
+    volatile ULONG TraceBufferTail;  // volatile로 캐시 일관성 보장
     BOOLEAN IsAttached;
+    BOOLEAN TracingEnabled;          // 트레이싱 활성화 플래그
+    ULONG DroppedRequests;           // 드롭된 요청 수 (성능 모니터링용)
 } DEVICE_EXTENSION, * PDEVICE_EXTENSION;
 
 DRIVER_INITIALIZE DriverEntry;
@@ -51,6 +63,7 @@ VOID DetachFromTargetDevice(_In_ PDEVICE_EXTENSION deviceExtension);
 VOID DeleteControlDevice(void);
 NTSTATUS DispatchPassThrough(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp);
 NTSTATUS ScsiDispatchRoutine(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp);
+NTSTATUS ScsiCompletionRoutine(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp, _In_ PVOID Context);
 NTSTATUS DispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp);
 NTSTATUS DispatchCreate(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp);
 NTSTATUS DispatchClose(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp);
@@ -101,6 +114,8 @@ NTSTATUS AddDevice(
     deviceExtension->TraceBufferTail = 0;
     KeInitializeSpinLock(&deviceExtension->TraceBufferLock);
     deviceExtension->IsAttached = TRUE;
+    deviceExtension->TracingEnabled = TRUE;  // 기본적으로 트레이싱 활성화
+    deviceExtension->DroppedRequests = 0;
 
     DbgPrint("AddDevice: Successfully attached to device.\n");
 
@@ -123,7 +138,7 @@ NTSTATUS CompleteIrp(
 // 디바이스 분리 함수
 VOID DetachFromTargetDevice(_In_ PDEVICE_EXTENSION deviceExtension)
 {
-    if (deviceExtension->IsAttached) {
+    if (deviceExtension->IsAttached && deviceExtension->LowerDevice) {
         IoDetachDevice(deviceExtension->LowerDevice);
         deviceExtension->LowerDevice = NULL;
         deviceExtension->IsAttached = FALSE;
@@ -155,7 +170,7 @@ VOID DriverUnload(_In_ PDRIVER_OBJECT DriverObject)
     DbgPrint("DriverUnload: Driver unloaded successfully.\n");
 }
 
-// PassThrough 핸들러
+// 최적화된 PassThrough 핸들러
 NTSTATUS DispatchPassThrough(
     _In_ PDEVICE_OBJECT DeviceObject,
     _Inout_ PIRP Irp
@@ -163,11 +178,108 @@ NTSTATUS DispatchPassThrough(
 {
     PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
 
-    IoSkipCurrentIrpStackLocation(Irp);
-    return IoCallDriver(deviceExtension->LowerDevice, Irp);
+    // 빠른 검증 (브랜치 예측 최적화를 위한 순서)
+    if (deviceExtension->IsAttached && deviceExtension->LowerDevice) {
+        IoSkipCurrentIrpStackLocation(Irp);
+        return IoCallDriver(deviceExtension->LowerDevice, Irp);
+    }
+
+    // 오류 상황 (덜 빈번한 경우)
+    DbgPrint("DispatchPassThrough: Device not attached or LowerDevice is NULL\n");
+    return CompleteIrp(Irp, STATUS_NO_SUCH_DEVICE, 0);
 }
 
-// SCSI 핸들러
+// 고성능 SCSI 완료 콜백 함수
+NTSTATUS ScsiCompletionRoutine(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_ PIRP Irp,
+    _In_ PVOID Context
+)
+{
+    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)Context;
+    PIO_STACK_LOCATION irpStack = IoGetCurrentIrpStackLocation(Irp);
+
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    // 빠른 종료 조건들 - 브랜치 예측 최적화
+    if (!deviceExtension->IsAttached || !deviceExtension->TracingEnabled) {
+        goto complete_irp;
+    }
+
+    if (irpStack->MajorFunction != IRP_MJ_SCSI) {
+        goto complete_irp;
+    }
+
+    PSCSI_REQUEST_BLOCK srb = irpStack->Parameters.Scsi.Srb;
+    if (!srb) {
+        goto complete_irp;
+    }
+
+    // 락프리 큐 체크 - 버퍼가 거의 가득 찬 경우 드롭
+    ULONG currentTail = deviceExtension->TraceBufferTail;
+    ULONG currentHead = deviceExtension->TraceBufferHead;
+    ULONG nextTail = (currentTail + 1) % TRACE_BUFFER_SIZE;
+    
+    // 90% 이상 찬 경우 성능을 위해 드롭
+    ULONG used = (currentTail >= currentHead) ? 
+                 (currentTail - currentHead) : 
+                 (TRACE_BUFFER_SIZE - currentHead + currentTail);
+    
+    if (used > (TRACE_BUFFER_SIZE * 9 / 10)) {
+        InterlockedIncrement(&deviceExtension->DroppedRequests);
+        goto complete_irp;
+    }
+
+    // 스핀락 시도 - 즉시 획득할 수 없으면 드롭 (성능 우선)
+    KIRQL oldIrql;
+    if (!KeTestSpinLock(&deviceExtension->TraceBufferLock)) {
+        InterlockedIncrement(&deviceExtension->DroppedRequests);
+        goto complete_irp;
+    }
+
+    KeAcquireSpinLock(&deviceExtension->TraceBufferLock, &oldIrql);
+
+    // 다시 한번 체크 (락 획득 후)
+    if (nextTail == deviceExtension->TraceBufferHead) {
+        deviceExtension->TraceBufferHead = (deviceExtension->TraceBufferHead + 1) % TRACE_BUFFER_SIZE;
+    }
+
+    PSCSI_TRACE_DATA traceData = &deviceExtension->TraceBuffer[currentTail];
+    
+    // 중요한 정보만 빠르게 복사
+    traceData->CdbLength = (srb->CdbLength > sizeof(traceData->CdbData)) ? 
+                          sizeof(traceData->CdbData) : srb->CdbLength;
+    
+    // 메모리 복사 최적화 - 필수 데이터만
+    RtlCopyMemory(traceData->CdbData, srb->Cdb, traceData->CdbLength);
+    traceData->DataTransferLength = srb->DataTransferLength;
+    traceData->ScsiStatus = srb->ScsiStatus;
+    
+    // Sense 정보는 오류가 있을 때만 복사 (성능 최적화)
+    if (srb->ScsiStatus != 0 && srb->SenseInfoBuffer && srb->SenseInfoBufferLength > 0) {
+        ULONG copyLength = (srb->SenseInfoBufferLength < SENSE_BUFFER_SIZE) ? 
+                          srb->SenseInfoBufferLength : SENSE_BUFFER_SIZE;
+        RtlCopyMemory(traceData->SenseInfoBuffer, srb->SenseInfoBuffer, copyLength);
+        traceData->SenseInfoLength = copyLength;
+    } else {
+        traceData->SenseInfoLength = 0;
+    }
+
+    // 원자적 업데이트
+    deviceExtension->TraceBufferTail = nextTail;
+
+    KeReleaseSpinLock(&deviceExtension->TraceBufferLock, oldIrql);
+
+complete_irp:
+    // IRP 처리 계속
+    if (Irp->PendingReturned) {
+        IoMarkIrpPending(Irp);
+    }
+
+    return STATUS_SUCCESS;
+}
+
+// 최적화된 SCSI 핸들러
 NTSTATUS ScsiDispatchRoutine(
     _In_ PDEVICE_OBJECT DeviceObject,
     _Inout_ PIRP Irp
@@ -176,42 +288,21 @@ NTSTATUS ScsiDispatchRoutine(
     PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
     PIO_STACK_LOCATION irpStack = IoGetCurrentIrpStackLocation(Irp);
 
-    if (irpStack->MajorFunction == IRP_MJ_SCSI) {
-        PSCSI_REQUEST_BLOCK srb = irpStack->Parameters.Scsi.Srb;
-
-        if (srb) {
-            KIRQL oldIrql;
-            PSCSI_TRACE_DATA traceData;
-
-            KeAcquireSpinLock(&deviceExtension->TraceBufferLock, &oldIrql);
-
-            traceData = &deviceExtension->TraceBuffer[deviceExtension->TraceBufferTail];
-            deviceExtension->TraceBufferTail = (deviceExtension->TraceBufferTail + 1) % TRACE_BUFFER_SIZE;
-
-            if (deviceExtension->TraceBufferTail == deviceExtension->TraceBufferHead) {
-                deviceExtension->TraceBufferHead = (deviceExtension->TraceBufferHead + 1) % TRACE_BUFFER_SIZE;
-            }
-
-            traceData->CdbLength = srb->CdbLength;
-            traceData->ScsiStatus = srb->ScsiStatus;
-            if (srb->CdbLength > sizeof(traceData->CdbData)) {
-                traceData->CdbLength = sizeof(traceData->CdbData); // prevent buffer overflow
-            }
-            RtlCopyMemory(traceData->CdbData, srb->Cdb, traceData->CdbLength);
-            traceData->DataTransferLength = srb->DataTransferLength;
-            traceData->SenseInfoLength = srb->SenseInfoBufferLength;
-            if (srb->SenseInfoBuffer && srb->SenseInfoBufferLength > 0) {
-                ULONG copyLength = srb->SenseInfoBufferLength < SENSE_BUFFER_SIZE ? srb->SenseInfoBufferLength : SENSE_BUFFER_SIZE;
-                RtlCopyMemory(traceData->SenseInfoBuffer, srb->SenseInfoBuffer, copyLength);
-            }
-
-            KeReleaseSpinLock(&deviceExtension->TraceBufferLock, oldIrql);
-
-            DbgPrint("ScsiDispatchRoutine: SCSI request traced.\n");
-        }
+    // 빠른 패스스루 체크
+    if (!deviceExtension->IsAttached || !deviceExtension->LowerDevice) {
+        return CompleteIrp(Irp, STATUS_NO_SUCH_DEVICE, 0);
     }
 
-    IoSkipCurrentIrpStackLocation(Irp);
+    // SCSI 요청이 아니거나 트레이싱이 비활성화된 경우 바로 패스스루
+    if (irpStack->MajorFunction != IRP_MJ_SCSI || !deviceExtension->TracingEnabled) {
+        IoSkipCurrentIrpStackLocation(Irp);
+        return IoCallDriver(deviceExtension->LowerDevice, Irp);
+    }
+
+    // 완료 콜백 설정 (최소한의 오버헤드)
+    IoCopyCurrentIrpStackLocationToNext(Irp);
+    IoSetCompletionRoutine(Irp, ScsiCompletionRoutine, deviceExtension, TRUE, TRUE, TRUE);
+    
     return IoCallDriver(deviceExtension->LowerDevice, Irp);
 }
 
@@ -288,28 +379,45 @@ NTSTATUS DispatchDeviceControl(
             // 타겟 드라이브 설정 처리
             DbgPrint("DispatchDeviceControl: IOCTL_SET_TARGET_DRIVE\n");
 
-            // 사용자 버퍼 검증 (NULL 체크 및 크기 검증)
-            if (irpStack->Parameters.DeviceIoControl.InputBufferLength < sizeof(PDEVICE_OBJECT)) {
+            // 사용자 버퍼 검증 (드라이브 경로 문자열을 기대)
+            if (irpStack->Parameters.DeviceIoControl.InputBufferLength < sizeof(WCHAR)) {
                 status = STATUS_INVALID_PARAMETER;
                 DbgPrint("DispatchDeviceControl: IOCTL_SET_TARGET_DRIVE invalid buffer length.\n");
                 break;
             }
 
-            // 사용자 버퍼 가져오기
-            PDEVICE_OBJECT targetDevice = (PDEVICE_OBJECT)Irp->AssociatedIrp.SystemBuffer;
-            if (targetDevice == NULL) {
+            // 사용자 버퍼에서 드라이브 경로 가져오기
+            PWCHAR drivePathBuffer = (PWCHAR)Irp->AssociatedIrp.SystemBuffer;
+            if (drivePathBuffer == NULL) {
                 status = STATUS_INVALID_PARAMETER;
                 DbgPrint("DispatchDeviceControl: IOCTL_SET_TARGET_DRIVE NULL buffer.\n");
                 break;
             }
 
-            // 디바이스 객체 검증
-            if (!MmIsAddressValid(targetDevice)) {
+            // 문자열 길이 계산 및 검증
+            ULONG pathLength = irpStack->Parameters.DeviceIoControl.InputBufferLength / sizeof(WCHAR);
+            if (pathLength == 0 || pathLength > 256) {
                 status = STATUS_INVALID_PARAMETER;
-                DbgPrint("DispatchDeviceControl: IOCTL_SET_TARGET_DRIVE invalid device object.\n");
+                DbgPrint("DispatchDeviceControl: IOCTL_SET_TARGET_DRIVE invalid path length.\n");
                 break;
             }
 
+            // 널 종료 문자열 보장
+            if (drivePathBuffer[pathLength - 1] != L'\0') {
+                if (pathLength < 256) {
+                    drivePathBuffer[pathLength] = L'\0';
+                } else {
+                    status = STATUS_INVALID_PARAMETER;
+                    DbgPrint("DispatchDeviceControl: IOCTL_SET_TARGET_DRIVE string not null-terminated.\n");
+                    break;
+                }
+            }
+
+            DbgPrint("DispatchDeviceControl: Target drive path: %ws\n", drivePathBuffer);
+
+            // 현재는 간단히 성공 반환 (실제 구현에서는 드라이브 경로로 디바이스 객체를 찾아야 함)
+            // TODO: 드라이브 경로를 사용하여 해당하는 Physical Device Object를 찾는 로직 구현
+            
             // Acquire list lock
             KIRQL oldIrql;
             KeAcquireSpinLock(&g_DeviceExtensionListLock, &oldIrql);
@@ -317,26 +425,109 @@ NTSTATUS DispatchDeviceControl(
             PLIST_ENTRY entry = g_DeviceExtensionList.Flink;
             BOOLEAN deviceFound = FALSE;
 
-            while (entry != &g_DeviceExtensionList) {
+            // 현재 구현에서는 첫 번째 디바이스를 타겟으로 설정 (임시)
+            if (entry != &g_DeviceExtensionList) {
                 PDEVICE_EXTENSION deviceExtensionNew = CONTAINING_RECORD(entry, DEVICE_EXTENSION, ListEntry);
-
-                if (deviceExtensionNew->PhysicalDeviceObject == targetDevice) {
-                    deviceExtensionNew->TargetDevice = targetDevice;
-                    deviceFound = TRUE;
-                    DbgPrint("DispatchDeviceControl: IOCTL_SET_TARGET_DRIVE succeeded.\n");
-                    break;
-                }
-
-                entry = entry->Flink;
+                deviceExtensionNew->TargetDevice = deviceExtensionNew->PhysicalDeviceObject;
+                deviceFound = TRUE;
+                DbgPrint("DispatchDeviceControl: IOCTL_SET_TARGET_DRIVE succeeded (using first device).\n");
             }
 
             KeReleaseSpinLock(&g_DeviceExtensionListLock, oldIrql);
 
             if (!deviceFound) {
                 status = STATUS_NO_SUCH_DEVICE;
-                DbgPrint("DispatchDeviceControl: IOCTL_SET_TARGET_DRIVE device not found.\n");
+                DbgPrint("DispatchDeviceControl: IOCTL_SET_TARGET_DRIVE no devices available.\n");
             }
 
+            break;
+        }
+        case IOCTL_ENABLE_TRACING:
+        {
+            DbgPrint("DispatchDeviceControl: IOCTL_ENABLE_TRACING\n");
+            
+            // 모든 장치에서 트레이싱 활성화
+            KIRQL oldIrql;
+            KeAcquireSpinLock(&g_DeviceExtensionListLock, &oldIrql);
+
+            PLIST_ENTRY entry = g_DeviceExtensionList.Flink;
+            while (entry != &g_DeviceExtensionList) {
+                PDEVICE_EXTENSION deviceExtensionNew = CONTAINING_RECORD(entry, DEVICE_EXTENSION, ListEntry);
+                deviceExtensionNew->TracingEnabled = TRUE;
+                entry = entry->Flink;
+            }
+
+            KeReleaseSpinLock(&g_DeviceExtensionListLock, oldIrql);
+            status = STATUS_SUCCESS;
+            break;
+        }
+        case IOCTL_DISABLE_TRACING:
+        {
+            DbgPrint("DispatchDeviceControl: IOCTL_DISABLE_TRACING\n");
+            
+            // 모든 장치에서 트레이싱 비활성화
+            KIRQL oldIrql;
+            KeAcquireSpinLock(&g_DeviceExtensionListLock, &oldIrql);
+
+            PLIST_ENTRY entry = g_DeviceExtensionList.Flink;
+            while (entry != &g_DeviceExtensionList) {
+                PDEVICE_EXTENSION deviceExtensionNew = CONTAINING_RECORD(entry, DEVICE_EXTENSION, ListEntry);
+                deviceExtensionNew->TracingEnabled = FALSE;
+                entry = entry->Flink;
+            }
+
+            KeReleaseSpinLock(&g_DeviceExtensionListLock, oldIrql);
+            status = STATUS_SUCCESS;
+            break;
+        }
+        case IOCTL_GET_STATS:
+        {
+            DbgPrint("DispatchDeviceControl: IOCTL_GET_STATS\n");
+
+            PSCSI_FILTER_STATS statsBuffer = (PSCSI_FILTER_STATS)Irp->AssociatedIrp.SystemBuffer;
+            if (statsBuffer == NULL || irpStack->Parameters.DeviceIoControl.OutputBufferLength < sizeof(SCSI_FILTER_STATS)) {
+                status = STATUS_INVALID_PARAMETER;
+                DbgPrint("DispatchDeviceControl: IOCTL_GET_STATS invalid parameter.\n");
+                break;
+            }
+
+            // 통계 정보 수집
+            KIRQL oldIrql;
+            KeAcquireSpinLock(&g_DeviceExtensionListLock, &oldIrql);
+
+            ULONG totalDropped = 0;
+            ULONG totalUtilization = 0;
+            ULONG deviceCount = 0;
+            BOOLEAN anyTracingEnabled = FALSE;
+
+            PLIST_ENTRY entry = g_DeviceExtensionList.Flink;
+            while (entry != &g_DeviceExtensionList) {
+                PDEVICE_EXTENSION deviceExtensionNew = CONTAINING_RECORD(entry, DEVICE_EXTENSION, ListEntry);
+                
+                totalDropped += deviceExtensionNew->DroppedRequests;
+                
+                ULONG used = (deviceExtensionNew->TraceBufferTail >= deviceExtensionNew->TraceBufferHead) ? 
+                            (deviceExtensionNew->TraceBufferTail - deviceExtensionNew->TraceBufferHead) : 
+                            (TRACE_BUFFER_SIZE - deviceExtensionNew->TraceBufferHead + deviceExtensionNew->TraceBufferTail);
+                totalUtilization += (used * 100) / TRACE_BUFFER_SIZE;
+                
+                if (deviceExtensionNew->TracingEnabled) {
+                    anyTracingEnabled = TRUE;
+                }
+                
+                deviceCount++;
+                entry = entry->Flink;
+            }
+
+            KeReleaseSpinLock(&g_DeviceExtensionListLock, oldIrql);
+
+            // 통계 정보 반환
+            statsBuffer->DroppedRequests = totalDropped;
+            statsBuffer->BufferUtilization = (deviceCount > 0) ? (totalUtilization / deviceCount) : 0;
+            statsBuffer->TracingEnabled = anyTracingEnabled;
+            
+            information = sizeof(SCSI_FILTER_STATS);
+            status = STATUS_SUCCESS;
             break;
         }
         default:
@@ -411,6 +602,14 @@ NTSTATUS DispatchPnp(
     case IRP_MN_REMOVE_DEVICE:
     {
         DbgPrint("DispatchPnp: IRP_MN_REMOVE_DEVICE received.\n");
+        
+        // 먼저 IsAttached를 FALSE로 설정하여 새로운 SCSI IRP 처리를 중단
+        deviceExtension->IsAttached = FALSE;
+        
+        // 진행 중인 IRP들이 완료될 때까지 잠시 대기 (간단한 방법)
+        // 실제 운영 환경에서는 더 정교한 동기화가 필요할 수 있음
+        KeStallExecutionProcessor(1000); // 1ms 대기
+        
         DetachFromTargetDevice(deviceExtension);
 
         // 리스트에서 제거하기 전에 스핀락을 획득

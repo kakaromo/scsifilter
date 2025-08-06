@@ -40,7 +40,7 @@ scsi_filter.sys
 AddReg=scsi_filter_AddReg
 
 [scsi_filter_AddReg]
-HKR,,UpperFilters,0x00010008,scsi_filter
+HKR,,LowerFilters,0x00010008,scsi_filter
 
 ;-------------- Service installation
 [scsi_filter_Device.NT.Services]
