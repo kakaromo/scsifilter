@@ -31,8 +31,8 @@ typedef struct _SCSI_TRACE_DATA {
 
 typedef struct _SCSI_FILTER_STATS {
     ULONG TotalRequests;
-    ULONG DroppedRequests;
-    ULONG BufferUtilization;  // 버퍼 사용률 (백분율)
+    LONG DroppedRequests;        // 드라이버와 일치시킴
+    ULONG BufferUtilization;     // 버퍼 사용률 (백분율)
     BOOLEAN TracingEnabled;
 } SCSI_FILTER_STATS, * PSCSI_FILTER_STATS;
 #pragma pack(pop)
@@ -44,7 +44,7 @@ wchar_t** drives = NULL;
 HANDLE hControlDevice = INVALID_HANDLE_VALUE;
 BOOL tracingEnabled = TRUE;
 DWORD lastStatsTime = 0;
-ULONG lastDroppedCount = 0;
+LONG lastDroppedCount = 0;  // LONG 타입으로 변경
 
 // 함수 선언
 BOOL ConsoleHandler(DWORD signal);
@@ -278,13 +278,13 @@ BOOL GetDriverStats(HANDLE hDevice, SCSI_FILTER_STATS* stats) {
 void PrintDriverStats(const SCSI_FILTER_STATS* stats) {
     wprintf(L"\n=== Driver Performance Statistics ===\n");
     wprintf(L"Tracing Status: %s\n", stats->TracingEnabled ? L"Enabled" : L"Disabled");
-    wprintf(L"Dropped Requests: %lu\n", stats->DroppedRequests);
+    wprintf(L"Dropped Requests: %ld\n", stats->DroppedRequests);  // %ld로 변경
     wprintf(L"Buffer Utilization: %lu%%\n", stats->BufferUtilization);
     
     // 드롭률 계산 및 경고
     if (stats->DroppedRequests > lastDroppedCount) {
-        ULONG newDrops = stats->DroppedRequests - lastDroppedCount;
-        wprintf(L"⚠️  New drops since last check: %lu\n", newDrops);
+        LONG newDrops = stats->DroppedRequests - lastDroppedCount;
+        wprintf(L"⚠️  New drops since last check: %ld\n", newDrops);  // %ld로 변경
         if (stats->BufferUtilization > 80) {
             wprintf(L"💡 High buffer utilization detected. Consider:\n");
             wprintf(L"   - Disabling tracing temporarily\n");

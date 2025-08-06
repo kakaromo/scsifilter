@@ -26,8 +26,8 @@ typedef struct _SCSI_TRACE_DATA {
 
 typedef struct _SCSI_FILTER_STATS {
     ULONG TotalRequests;
-    ULONG DroppedRequests;
-    ULONG BufferUtilization;  // 버퍼 사용률 (백분율)
+    LONG DroppedRequests;        // LONG 타입으로 변경
+    ULONG BufferUtilization;     // 버퍼 사용률 (백분율)
     BOOLEAN TracingEnabled;
 } SCSI_FILTER_STATS, * PSCSI_FILTER_STATS;
 #pragma pack(pop)
@@ -43,7 +43,7 @@ typedef struct _DEVICE_EXTENSION {
     volatile ULONG TraceBufferTail;  // volatile로 캐시 일관성 보장
     BOOLEAN IsAttached;
     BOOLEAN TracingEnabled;          // 트레이싱 활성화 플래그
-    ULONG DroppedRequests;           // 드롭된 요청 수 (성능 모니터링용)
+    volatile LONG DroppedRequests;   // InterlockedIncrement를 위해 LONG 타입으로 변경
 } DEVICE_EXTENSION, * PDEVICE_EXTENSION;
 
 DRIVER_INITIALIZE DriverEntry;
@@ -230,13 +230,8 @@ NTSTATUS ScsiCompletionRoutine(
         goto complete_irp;
     }
 
-    // 스핀락 시도 - 즉시 획득할 수 없으면 드롭 (성능 우선)
+    // 스핀락 획득 시도
     KIRQL oldIrql;
-    if (!KeTestSpinLock(&deviceExtension->TraceBufferLock)) {
-        InterlockedIncrement(&deviceExtension->DroppedRequests);
-        goto complete_irp;
-    }
-
     KeAcquireSpinLock(&deviceExtension->TraceBufferLock, &oldIrql);
 
     // 다시 한번 체크 (락 획득 후)
@@ -495,7 +490,7 @@ NTSTATUS DispatchDeviceControl(
             KIRQL oldIrql;
             KeAcquireSpinLock(&g_DeviceExtensionListLock, &oldIrql);
 
-            ULONG totalDropped = 0;
+            LONG totalDropped = 0;
             ULONG totalUtilization = 0;
             ULONG deviceCount = 0;
             BOOLEAN anyTracingEnabled = FALSE;
@@ -525,6 +520,7 @@ NTSTATUS DispatchDeviceControl(
             statsBuffer->DroppedRequests = totalDropped;
             statsBuffer->BufferUtilization = (deviceCount > 0) ? (totalUtilization / deviceCount) : 0;
             statsBuffer->TracingEnabled = anyTracingEnabled;
+            statsBuffer->TotalRequests = 0;  // 현재 구현에서는 사용하지 않음
             
             information = sizeof(SCSI_FILTER_STATS);
             status = STATUS_SUCCESS;
@@ -606,9 +602,11 @@ NTSTATUS DispatchPnp(
         // 먼저 IsAttached를 FALSE로 설정하여 새로운 SCSI IRP 처리를 중단
         deviceExtension->IsAttached = FALSE;
         
-        // 진행 중인 IRP들이 완료될 때까지 잠시 대기 (간단한 방법)
-        // 실제 운영 환경에서는 더 정교한 동기화가 필요할 수 있음
-        KeStallExecutionProcessor(1000); // 1ms 대기
+        // 진행 중인 IRP들이 완료될 때까지 잠시 대기
+        // 더 안전한 대기 방법 사용
+        LARGE_INTEGER delay;
+        delay.QuadPart = -10000; // 1ms (100ns 단위)
+        KeDelayExecutionThread(KernelMode, FALSE, &delay);
         
         DetachFromTargetDevice(deviceExtension);
 
