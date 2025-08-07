@@ -32,6 +32,7 @@ scsi_filter.sys = 1,,
 [Standard.NT$ARCH$.10.0...16299]
 %scsi_filter.DeviceDesc%=scsi_filter_Device, GenDisk
 %scsi_filter.DeviceDesc%=scsi_filter_Device, DiskPeripheral
+%scsi_filter.DeviceDesc%=scsi_filter_Device, SCSIPort_DeviceDesc
 
 ;*****************************************
 ; Device Installation
@@ -85,3 +86,4 @@ ManufacturerName="SCSI Filter Driver Provider"
 DiskName = "SCSI Filter Driver Installation Disk"
 scsi_filter.DeviceDesc = "SCSI Disk Filter Driver"
 scsi_filter.SVCDESC = "SCSI Disk Filter Service"
+SCSIPort_DeviceDesc = "SCSI Port"

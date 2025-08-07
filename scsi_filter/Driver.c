@@ -69,6 +69,7 @@ NTSTATUS DispatchCreate(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp);
 NTSTATUS DispatchClose(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp);
 NTSTATUS DispatchPnp(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp);
 NTSTATUS DispatchPower(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp);
+NTSTATUS RegisterFilterDriver(void);
 
 // AddDevice 함수
 NTSTATUS AddDevice(
@@ -696,5 +697,136 @@ NTSTATUS DriverEntry(
 
     DbgPrint("DriverEntry: Control device created successfully.\n");
 
+    // 필터 드라이버를 디스크 클래스에 등록 시도
+    status = RegisterFilterDriver();
+    if (!NT_SUCCESS(status)) {
+        DbgPrint("DriverEntry: RegisterFilterDriver failed with status 0x%X\n", status);
+        // 필터 등록 실패해도 드라이버는 계속 로드 (수동 등록 가능)
+    }
+
     return STATUS_SUCCESS;
+}
+
+// 필터 드라이버를 디스크 디바이스에 등록하는 함수
+NTSTATUS RegisterFilterDriver(void)
+{
+    NTSTATUS status;
+    UNICODE_STRING regPath;
+    UNICODE_STRING valueName;
+    OBJECT_ATTRIBUTES objAttrs;
+    HANDLE regHandle = NULL;
+    PWSTR filterList = NULL;
+    ULONG filterListSize = 0;
+    ULONG resultLength = 0;
+    
+    // 디스크 클래스 키 경로 설정
+    RtlInitUnicodeString(&regPath, 
+        L"\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Class\\{4D36E967-E325-11CE-BFC1-08002BE10318}");
+    
+    InitializeObjectAttributes(&objAttrs,
+                               &regPath,
+                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+                               NULL,
+                               NULL);
+    
+    // 레지스트리 키 열기
+    status = ZwOpenKey(&regHandle, KEY_ALL_ACCESS, &objAttrs);
+    if (!NT_SUCCESS(status)) {
+        DbgPrint("RegisterFilterDriver: Failed to open disk class registry key. Status: 0x%X\n", status);
+        return status;
+    }
+    
+    // LowerFilters 값 읽기
+    RtlInitUnicodeString(&valueName, L"LowerFilters");
+    
+    // 먼저 필요한 버퍼 크기 확인
+    status = ZwQueryValueKey(regHandle,
+                             &valueName,
+                             KeyValuePartialInformation,
+                             NULL,
+                             0,
+                             &resultLength);
+    
+    if (status == STATUS_BUFFER_TOO_SMALL) {
+        // 기존 LowerFilters 값이 있는 경우
+        PKEY_VALUE_PARTIAL_INFORMATION valueInfo = 
+            (PKEY_VALUE_PARTIAL_INFORMATION)ExAllocatePoolWithTag(NonPagedPool, resultLength, 'RegV');
+        
+        if (valueInfo) {
+            status = ZwQueryValueKey(regHandle,
+                                     &valueName,
+                                     KeyValuePartialInformation,
+                                     valueInfo,
+                                     resultLength,
+                                     &resultLength);
+            
+            if (NT_SUCCESS(status) && valueInfo->Type == REG_MULTI_SZ) {
+                // 기존 필터 목록 검사 - 이미 등록되어 있는지 확인
+                PWSTR currentFilter = (PWSTR)valueInfo->Data;
+                BOOLEAN alreadyExists = FALSE;
+                
+                while (*currentFilter) {
+                    if (wcscmp(currentFilter, L"scsi_filter") == 0) {
+                        alreadyExists = TRUE;
+                        break;
+                    }
+                    // 다음 문자열로 이동
+                    currentFilter += wcslen(currentFilter) + 1;
+                }
+                
+                if (!alreadyExists) {
+                    // 새로운 필터 목록 생성 (기존 + scsi_filter + 널 종료)
+                    filterListSize = valueInfo->DataLength + sizeof(L"scsi_filter") + sizeof(WCHAR);
+                    filterList = (PWSTR)ExAllocatePoolWithTag(NonPagedPool, filterListSize, 'RegF');
+                    
+                    if (filterList) {
+                        // 기존 데이터 복사
+                        RtlCopyMemory(filterList, valueInfo->Data, valueInfo->DataLength - sizeof(WCHAR));
+                        // scsi_filter 추가
+                        wcscpy((PWSTR)((PUCHAR)filterList + valueInfo->DataLength - sizeof(WCHAR)), L"scsi_filter");
+                        // 마지막 널 종료 문자 추가
+                        *((PWCHAR)((PUCHAR)filterList + filterListSize - sizeof(WCHAR))) = L'\0';
+                    }
+                } else {
+                    DbgPrint("RegisterFilterDriver: scsi_filter already registered in LowerFilters\n");
+                    status = STATUS_SUCCESS;
+                }
+            }
+            
+            ExFreePoolWithTag(valueInfo, 'RegV');
+        }
+    } else if (status == STATUS_OBJECT_NAME_NOT_FOUND) {
+        // LowerFilters 값이 없는 경우 - 새로 생성
+        filterListSize = sizeof(L"scsi_filter") + sizeof(WCHAR); // 널 종료 포함
+        filterList = (PWSTR)ExAllocatePoolWithTag(NonPagedPool, filterListSize, 'RegF');
+        
+        if (filterList) {
+            wcscpy(filterList, L"scsi_filter");
+            filterList[wcslen(L"scsi_filter") + 1] = L'\0'; // 두 번째 널 종료
+        }
+    }
+    
+    // 새로운 필터 목록을 레지스트리에 저장
+    if (filterList) {
+        status = ZwSetValueKey(regHandle,
+                               &valueName,
+                               0,
+                               REG_MULTI_SZ,
+                               filterList,
+                               filterListSize);
+        
+        if (NT_SUCCESS(status)) {
+            DbgPrint("RegisterFilterDriver: Successfully registered scsi_filter in LowerFilters\n");
+        } else {
+            DbgPrint("RegisterFilterDriver: Failed to set LowerFilters value. Status: 0x%X\n", status);
+        }
+        
+        ExFreePoolWithTag(filterList, 'RegF');
+    }
+    
+    if (regHandle) {
+        ZwClose(regHandle);
+    }
+    
+    return status;
 }

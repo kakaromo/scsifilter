@@ -7,6 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <conio.h>  // _kbhit(), _getch() 함수용
+#include <Shlobj.h> // IsUserAnAdmin 함수용
+#include <vector>   // std::vector 사용용
 
 #define IOCTL_GET_SCSI_DATA CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_SET_TARGET_DRIVE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
@@ -61,6 +63,372 @@ BOOL GetDriverStats(HANDLE hDevice, SCSI_FILTER_STATS* stats);
 void PrintDriverStats(const SCSI_FILTER_STATS* stats);
 void ShowMenu();
 BOOL ProcessUserInput();
+BOOL CheckDriverStatus();
+void ShowDriverInstallationGuide();
+void RunDiagnostics();
+bool AutoRegisterFilterDriver();
+bool CheckFilterRegistration();
+bool UninstallFilterDriver();
+// 필터 드라이버 자동 등록 함수
+bool AutoRegisterFilterDriver() {
+    printf("자동 필터 드라이버 등록을 시도합니다...
+");
+    
+    // 1. 드라이버 서비스가 실행 중인지 확인
+    if (!CheckDriverStatus()) {
+        printf("드라이버 서비스가 실행되지 않았습니다. 먼저 드라이버를 시작하세요.
+");
+        return false;
+    }
+    
+    // 2. 관리자 권한 확인
+    BOOL isAdmin = FALSE;
+    PSID adminGroup = NULL;
+    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+    
+    if (AllocateAndInitializeSid(&ntAuthority, 2, SECURITY_BUILTIN_DOMAIN_RID,
+                                 DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &adminGroup)) {
+        CheckTokenMembership(NULL, adminGroup, &isAdmin);
+        FreeSid(adminGroup);
+    }
+    
+    if (!isAdmin) {
+        printf("관리자 권한이 필요합니다. 관리자로 실행하세요.
+");
+        return false;
+    }
+    
+    // 3. 레지스트리를 통한 필터 등록
+    HKEY hKey;
+    LONG result = RegOpenKeyEx(HKEY_LOCAL_MACHINE,
+                               L"SYSTEM\CurrentControlSet\Control\Class\{4D36E967-E325-11CE-BFC1-08002BE10318}",
+                               0, KEY_READ | KEY_WRITE, &hKey);
+    
+    if (result != ERROR_SUCCESS) {
+        printf("디스크 클래스 레지스트리 키를 열 수 없습니다. (Error: %ld)
+", result);
+        return false;
+    }
+    
+    // 4. 기존 LowerFilters 값 읽기
+    DWORD dataType;
+    DWORD dataSize = 0;
+    result = RegQueryValueEx(hKey, L"LowerFilters", NULL, &dataType, NULL, &dataSize);
+    
+    std::vector<wchar_t> newFilterData;
+    
+    if (result == ERROR_SUCCESS && dataType == REG_MULTI_SZ) {
+        // 기존 필터 목록이 있는 경우
+        std::vector<wchar_t> existingData(dataSize / sizeof(wchar_t));
+        result = RegQueryValueEx(hKey, L"LowerFilters", NULL, &dataType, 
+                                 (LPBYTE)existingData.data(), &dataSize);
+        
+        if (result == ERROR_SUCCESS) {
+            // scsi_filter가 이미 등록되어 있는지 확인
+            const wchar_t* currentFilter = existingData.data();
+            bool alreadyExists = false;
+            
+            while (*currentFilter) {
+                if (wcscmp(currentFilter, L"scsi_filter") == 0) {
+                    alreadyExists = true;
+                    break;
+                }
+                currentFilter += wcslen(currentFilter) + 1;
+            }
+            
+            if (alreadyExists) {
+                printf("scsi_filter가 이미 LowerFilters에 등록되어 있습니다.
+");
+                RegCloseKey(hKey);
+                return true;
+            }
+            
+            // 새로운 필터 목록 생성 (기존 + scsi_filter)
+            newFilterData = existingData;
+            newFilterData.resize(newFilterData.size() - 1); // 마지막 널 제거
+            
+            // scsi_filter 추가
+            const wchar_t* filterName = L"scsi_filter";
+            newFilterData.insert(newFilterData.end(), filterName, filterName + wcslen(filterName) + 1);
+            newFilterData.push_back(L'\0'); // 마지막 널 종료 추가
+        }
+    } else if (result == ERROR_FILE_NOT_FOUND) {
+        // LowerFilters 값이 없는 경우 - 새로 생성
+        const wchar_t* filterName = L"scsi_filter";
+        newFilterData.assign(filterName, filterName + wcslen(filterName) + 1);
+        newFilterData.push_back(L'\0'); // 마지막 널 종료 추가
+    } else {
+        printf("LowerFilters 값을 읽는데 실패했습니다. (Error: %ld)
+", result);
+        RegCloseKey(hKey);
+        return false;
+    }
+    
+    // 5. 새로운 필터 목록을 레지스트리에 저장
+    result = RegSetValueEx(hKey, L"LowerFilters", 0, REG_MULTI_SZ,
+                           (LPBYTE)newFilterData.data(),
+                           (DWORD)(newFilterData.size() * sizeof(wchar_t)));
+    
+    RegCloseKey(hKey);
+    
+    if (result == ERROR_SUCCESS) {
+        printf("scsi_filter가 성공적으로 LowerFilters에 등록되었습니다.
+");
+        printf("변경사항을 적용하려면 시스템을 재부팅하세요.
+");
+        return true;
+    } else {
+        printf("LowerFilters 값을 설정하는데 실패했습니다. (Error: %ld)
+", result);
+        return false;
+    }
+}
+
+// 필터 드라이버 제거 함수
+bool UninstallFilterDriver() {
+    printf("SCSI 필터 드라이버를 제거합니다...\n");
+    
+    // 1. 관리자 권한 확인
+    BOOL isAdmin = FALSE;
+    PSID adminGroup = NULL;
+    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+    
+    if (AllocateAndInitializeSid(&ntAuthority, 2, SECURITY_BUILTIN_DOMAIN_RID,
+                                 DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &adminGroup)) {
+        CheckTokenMembership(NULL, adminGroup, &isAdmin);
+        FreeSid(adminGroup);
+    }
+    
+    if (!isAdmin) {
+        printf("관리자 권한이 필요합니다. 관리자로 실행하세요.\n");
+        return false;
+    }
+    
+    bool success = true;
+    
+    // 2. 드라이버 서비스 중지 및 삭제
+    printf("드라이버 서비스를 중지하고 삭제합니다...\n");
+    SC_HANDLE scManager = OpenSCManager(NULL, NULL, SC_MANAGER_ALL_ACCESS);
+    if (scManager != NULL) {
+        SC_HANDLE service = OpenService(scManager, L"scsi_filter", SERVICE_ALL_ACCESS);
+        if (service != NULL) {
+            // 서비스 중지
+            SERVICE_STATUS status;
+            if (ControlService(service, SERVICE_CONTROL_STOP, &status)) {
+                printf("✓ 드라이버 서비스가 중지되었습니다.\n");
+                // 서비스가 완전히 중지될 때까지 대기
+                Sleep(2000);
+            } else {
+                DWORD error = GetLastError();
+                if (error == ERROR_SERVICE_NOT_ACTIVE) {
+                    printf("✓ 드라이버 서비스가 이미 중지되어 있습니다.\n");
+                } else {
+                    printf("⚠️  드라이버 서비스 중지 실패 (Error: %ld)\n", error);
+                }
+            }
+            
+            // 서비스 삭제
+            if (DeleteService(service)) {
+                printf("✓ 드라이버 서비스가 삭제되었습니다.\n");
+            } else {
+                printf("✗ 드라이버 서비스 삭제 실패 (Error: %ld)\n", GetLastError());
+                success = false;
+            }
+            
+            CloseServiceHandle(service);
+        } else {
+            DWORD error = GetLastError();
+            if (error == ERROR_SERVICE_DOES_NOT_EXIST) {
+                printf("✓ 드라이버 서비스가 이미 삭제되어 있습니다.\n");
+            } else {
+                printf("✗ 드라이버 서비스에 접근할 수 없습니다 (Error: %ld)\n", error);
+                success = false;
+            }
+        }
+        CloseServiceHandle(scManager);
+    } else {
+        printf("✗ Service Control Manager에 접근할 수 없습니다.\n");
+        success = false;
+    }
+    
+    // 3. 레지스트리에서 필터 제거
+    printf("레지스트리에서 필터를 제거합니다...\n");
+    HKEY hKey;
+    LONG result = RegOpenKeyEx(HKEY_LOCAL_MACHINE,
+                               L"SYSTEM\\CurrentControlSet\\Control\\Class\\{4D36E967-E325-11CE-BFC1-08002BE10318}",
+                               0, KEY_READ | KEY_WRITE, &hKey);
+    
+    if (result == ERROR_SUCCESS) {
+        DWORD dataType;
+        DWORD dataSize = 0;
+        result = RegQueryValueEx(hKey, L"LowerFilters", NULL, &dataType, NULL, &dataSize);
+        
+        if (result == ERROR_SUCCESS && dataType == REG_MULTI_SZ) {
+            std::vector<wchar_t> existingData(dataSize / sizeof(wchar_t));
+            result = RegQueryValueEx(hKey, L"LowerFilters", NULL, &dataType, 
+                                     (LPBYTE)existingData.data(), &dataSize);
+            
+            if (result == ERROR_SUCCESS) {
+                // scsi_filter를 제거한 새로운 필터 목록 생성
+                std::vector<wchar_t> newFilterData;
+                const wchar_t* currentFilter = existingData.data();
+                bool removed = false;
+                
+                while (*currentFilter) {
+                    if (wcscmp(currentFilter, L"scsi_filter") != 0) {
+                        // scsi_filter가 아닌 필터들만 새 목록에 추가
+                        size_t filterLen = wcslen(currentFilter);
+                        newFilterData.insert(newFilterData.end(), currentFilter, currentFilter + filterLen + 1);
+                    } else {
+                        removed = true;
+                    }
+                    currentFilter += wcslen(currentFilter) + 1;
+                }
+                
+                if (removed) {
+                    if (newFilterData.empty()) {
+                        // 다른 필터가 없으면 LowerFilters 값 삭제
+                        if (RegDeleteValue(hKey, L"LowerFilters") == ERROR_SUCCESS) {
+                            printf("✓ LowerFilters 값이 삭제되었습니다.\n");
+                        } else {
+                            printf("✗ LowerFilters 값 삭제 실패\n");
+                            success = false;
+                        }
+                    } else {
+                        // 다른 필터가 있으면 업데이트
+                        newFilterData.push_back(L'\0'); // 마지막 널 종료 추가
+                        
+                        result = RegSetValueEx(hKey, L"LowerFilters", 0, REG_MULTI_SZ,
+                                               (LPBYTE)newFilterData.data(),
+                                               (DWORD)(newFilterData.size() * sizeof(wchar_t)));
+                        
+                        if (result == ERROR_SUCCESS) {
+                            printf("✓ scsi_filter가 LowerFilters에서 제거되었습니다.\n");
+                        } else {
+                            printf("✗ LowerFilters 업데이트 실패 (Error: %ld)\n", result);
+                            success = false;
+                        }
+                    }
+                } else {
+                    printf("✓ scsi_filter가 LowerFilters에 등록되어 있지 않았습니다.\n");
+                }
+            }
+        } else if (result == ERROR_FILE_NOT_FOUND) {
+            printf("✓ LowerFilters 값이 존재하지 않습니다.\n");
+        } else {
+            printf("✗ LowerFilters 값을 읽을 수 없습니다 (Error: %ld)\n", result);
+            success = false;
+        }
+        
+        RegCloseKey(hKey);
+    } else {
+        printf("✗ 디스크 클래스 레지스트리 키에 접근할 수 없습니다 (Error: %ld)\n", result);
+        success = false;
+    }
+    
+    // 4. INF 파일을 통해 설치된 경우 제거 시도
+    printf("INF 파일을 통해 설치된 드라이버를 제거합니다...\n");
+    wchar_t cmdLine[512];
+    swprintf(cmdLine, 512, L"pnputil /delete-driver scsi_filter.inf /uninstall /force");
+    
+    STARTUPINFO si = { sizeof(si) };
+    PROCESS_INFORMATION pi;
+    
+    if (CreateProcess(NULL, cmdLine, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, 10000); // 10초 대기
+        
+        DWORD exitCode;
+        if (GetExitCodeProcess(pi.hProcess, &exitCode)) {
+            if (exitCode == 0) {
+                printf("✓ INF 드라이버가 제거되었습니다.\n");
+            } else {
+                printf("⚠️  INF 드라이버 제거 실패 또는 설치되지 않았음 (Exit code: %ld)\n", exitCode);
+            }
+        }
+        
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    } else {
+        printf("⚠️  pnputil 실행 실패. 수동으로 제거해야 할 수 있습니다.\n");
+    }
+    
+    if (success) {
+        printf("\n✅ 드라이버 제거가 완료되었습니다.\n");
+        printf("변경사항을 완전히 적용하려면 시스템을 재부팅하세요.\n");
+    } else {
+        printf("\n⚠️  일부 제거 과정에서 오류가 발생했습니다.\n");
+        printf("수동으로 다음을 확인해주세요:\n");
+        printf("1. 서비스: sc delete scsi_filter\n");
+        printf("2. 레지스트리: LowerFilters 값에서 scsi_filter 제거\n");
+        printf("3. INF: pnputil /delete-driver scsi_filter.inf /uninstall\n");
+    }
+    
+    return success;
+}
+    
+    if (result != ERROR_SUCCESS) {
+        printf("디스크 클래스 레지스트리 키를 열 수 없습니다.
+");
+        return false;
+    }
+    
+    DWORD dataType;
+    DWORD dataSize = 0;
+    result = RegQueryValueEx(hKey, L"LowerFilters", NULL, &dataType, NULL, &dataSize);
+    
+    if (result == ERROR_FILE_NOT_FOUND) {
+        printf("LowerFilters 값이 설정되지 않았습니다.
+");
+        RegCloseKey(hKey);
+        return false;
+    }
+    
+    if (result != ERROR_SUCCESS || dataType != REG_MULTI_SZ) {
+        printf("LowerFilters 값을 읽을 수 없습니다.
+");
+        RegCloseKey(hKey);
+        return false;
+    }
+    
+    std::vector<wchar_t> filterData(dataSize / sizeof(wchar_t));
+    result = RegQueryValueEx(hKey, L"LowerFilters", NULL, &dataType, 
+                             (LPBYTE)filterData.data(), &dataSize);
+    
+    RegCloseKey(hKey);
+    
+    if (result != ERROR_SUCCESS) {
+        printf("LowerFilters 값을 읽는데 실패했습니다.
+");
+        return false;
+    }
+    
+    // scsi_filter가 등록되어 있는지 확인
+    const wchar_t* currentFilter = filterData.data();
+    bool found = false;
+    
+    printf("현재 등록된 Lower Filters:
+");
+    while (*currentFilter) {
+        printf("  - %ws
+", currentFilter);
+        if (wcscmp(currentFilter, L"scsi_filter") == 0) {
+            found = true;
+        }
+        currentFilter += wcslen(currentFilter) + 1;
+    }
+    
+    if (found) {
+        printf("✓ scsi_filter가 LowerFilters에 등록되어 있습니다.
+");
+    } else {
+        printf("✗ scsi_filter가 LowerFilters에 등록되지 않았습니다.
+");
+    }
+    
+    return found;
+}
+
+bool TryConnectToDriver(HANDLE& hDevice) {
 
 void CleanupResources() {
     if (hControlDevice != INVALID_HANDLE_VALUE) {
@@ -299,6 +667,8 @@ void ShowMenu() {
     wprintf(L"\n=== SCSI Tracer Control Menu ===\n");
     wprintf(L"[SPACE] - Toggle tracing on/off\n");
     wprintf(L"[S]     - Show driver statistics\n");
+    wprintf(L"[D]     - Run diagnostics\n");
+    wprintf(L"[U]     - Uninstall driver\n");
     wprintf(L"[C]     - Clear screen\n");
     wprintf(L"[ESC]   - Save and exit\n");
     wprintf(L"[H]     - Show this help\n");
@@ -327,6 +697,32 @@ BOOL ProcessUserInput() {
             return TRUE;
         }
         
+        case 'd':
+        case 'D': // Diagnostics
+            RunDiagnostics();
+            return TRUE;
+            
+        case 'u':
+        case 'U': // Uninstall driver
+        {
+            wprintf(L"\n⚠️  드라이버를 제거하시겠습니까? (Y/N): ");
+            int confirm = _getch();
+            if (confirm == 'Y' || confirm == 'y') {
+                wprintf(L"Y\n");
+                wprintf(L"드라이버를 제거합니다...\n");
+                if (UninstallFilterDriver()) {
+                    wprintf(L"드라이버 제거가 완료되었습니다. 프로그램을 종료합니다.\n");
+                    SaveTraceDataToCSV(L"scsi_trace_data.csv");
+                    return FALSE; // 프로그램 종료
+                } else {
+                    wprintf(L"드라이버 제거 중 오류가 발생했습니다.\n");
+                }
+            } else {
+                wprintf(L"N\n드라이버 제거가 취소되었습니다.\n");
+            }
+            return TRUE;
+        }
+        
         case 'c':
         case 'C': // Clear screen
             system("cls");
@@ -345,6 +741,183 @@ BOOL ProcessUserInput() {
         }
     }
     return TRUE;
+}
+
+BOOL CheckDriverStatus() {
+    SC_HANDLE scManager = OpenSCManager(NULL, NULL, SC_MANAGER_CONNECT);
+    if (scManager == NULL) {
+        wprintf(L"Failed to open Service Control Manager. Error: %lu\n", GetLastError());
+        return FALSE;
+    }
+    
+    SC_HANDLE service = OpenService(scManager, L"scsi_filter", SERVICE_QUERY_STATUS);
+    if (service == NULL) {
+        DWORD error = GetLastError();
+        CloseServiceHandle(scManager);
+        
+        if (error == ERROR_SERVICE_DOES_NOT_EXIST) {
+            wprintf(L"❌ SCSI Filter driver service is not installed.\n");
+            ShowDriverInstallationGuide();
+        } else {
+            wprintf(L"Failed to open scsi_filter service. Error: %lu\n", error);
+        }
+        return FALSE;
+    }
+    
+    SERVICE_STATUS status;
+    if (!QueryServiceStatus(service, &status)) {
+        wprintf(L"Failed to query service status. Error: %lu\n", GetLastError());
+        CloseServiceHandle(service);
+        CloseServiceHandle(scManager);
+        return FALSE;
+    }
+    
+    CloseServiceHandle(service);
+    CloseServiceHandle(scManager);
+    
+    switch (status.dwCurrentState) {
+    case SERVICE_RUNNING:
+        wprintf(L"✅ SCSI Filter driver is running.\n");
+        return TRUE;
+    case SERVICE_STOPPED:
+        wprintf(L"⚠️  SCSI Filter driver is installed but stopped.\n");
+        wprintf(L"Run: sc start scsi_filter (as Administrator)\n");
+        return FALSE;
+    case SERVICE_PAUSED:
+        wprintf(L"⚠️  SCSI Filter driver is paused.\n");
+        return FALSE;
+    default:
+        wprintf(L"⚠️  SCSI Filter driver is in state: %lu\n", status.dwCurrentState);
+        return FALSE;
+    }
+}
+
+void ShowDriverInstallationGuide() {
+    wprintf(L"\n=== SCSI 필터 드라이버 설치 가이드 ===\n\n");
+    
+    wprintf(L"방법 1: INF 파일을 사용한 설치 (권장)\n");
+    wprintf(L"---------------------------------------\n");
+    wprintf(L"1. 관리자 권한으로 명령 프롬프트를 실행하세요\n");
+    wprintf(L"2. 드라이버 디렉토리로 이동: cd \"드라이버_경로\"\n");
+    wprintf(L"3. INF 파일 설치: pnputil /add-driver scsi_filter.inf /install\n");
+    wprintf(L"4. 드라이버 서비스 시작: sc start scsi_filter\n");
+    wprintf(L"5. 시스템 재부팅\n\n");
+    
+    wprintf(L"방법 2: 레지스트리를 통한 수동 등록\n");
+    wprintf(L"----------------------------------\n");
+    wprintf(L"1. 관리자 권한으로 레지스트리 편집기(regedit) 실행\n");
+    wprintf(L"2. 다음 경로로 이동:\n");
+    wprintf(L"   HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Class\\\n");
+    wprintf(L"   {4D36E967-E325-11CE-BFC1-08002BE10318}\n");
+    wprintf(L"3. 'LowerFilters' 값을 찾거나 새로 생성 (형식: REG_MULTI_SZ)\n");
+    wprintf(L"4. 값 데이터에 'scsi_filter' 추가\n");
+    wprintf(L"5. 드라이버 서비스 등록:\n");
+    wprintf(L"   sc create scsi_filter binPath= \"C:\\path\\to\\scsi_filter.sys\" type= kernel start= system\n");
+    wprintf(L"6. 드라이버 서비스 시작: sc start scsi_filter\n");
+    wprintf(L"7. 시스템 재부팅\n\n");
+    
+    wprintf(L"방법 3: DevCon 도구 사용 (고급 사용자)\n");
+    wprintf(L"-------------------------------------\n");
+    wprintf(L"1. Windows SDK에서 devcon.exe 다운로드\n");
+    wprintf(L"2. 관리자 권한으로 실행:\n");
+    wprintf(L"   devcon install scsi_filter.inf *\n");
+    wprintf(L"3. 시스템 재부팅\n\n");
+    
+    wprintf(L"중요 참고사항:\n");
+    wprintf(L"- 필터 드라이버는 시스템 재부팅 후에 활성화됩니다\n");
+    wprintf(L"- 디지털 서명되지 않은 드라이버의 경우 테스트 모드 활성화가 필요할 수 있습니다\n");
+    wprintf(L"- 테스트 모드: bcdedit /set testsigning on (재부팅 필요)\n");
+    wprintf(L"- 시스템 복원 지점을 미리 생성하는 것을 권장합니다\n\n");
+    
+    wprintf(L"문제 해결:\n");
+    wprintf(L"- 드라이버 로드 실패: 로그를 확인하고 서명 문제를 점검하세요\n");
+    wprintf(L"- 장치 인식 실패: 디바이스 매니저에서 드라이버 상태를 확인하세요\n");
+    wprintf(L"- 성능 문제: 시스템 이벤트 로그를 모니터링하세요\n\n");
+    
+    wprintf(L"드라이버 제거 방법:\n");
+    wprintf(L"------------------\n");
+    wprintf(L"1. 앱에서 [U] 키를 누르면 자동 제거\n");
+    wprintf(L"2. 수동 제거:\n");
+    wprintf(L"   - 서비스 삭제: sc delete scsi_filter\n");
+    wprintf(L"   - 레지스트리에서 LowerFilters 값의 scsi_filter 제거\n");
+    wprintf(L"   - INF 제거: pnputil /delete-driver scsi_filter.inf /uninstall\n");
+    wprintf(L"   - 시스템 재부팅\n");
+    wprintf(L"=============================================\n\n");
+}
+
+BOOL TryConnectToDriver() {
+    // 여러 가능한 디바이스 경로 시도
+    const wchar_t* devicePaths[] = {
+        L"\\\\.\\SCSITraceControl",
+        L"\\\\.\\Global\\SCSITraceControl",
+        L"\\Device\\SCSITraceControl"
+    };
+    
+    for (int i = 0; i < 3; i++) {
+        HANDLE testHandle = CreateFileW(devicePaths[i], 
+                                       GENERIC_READ | GENERIC_WRITE, 
+                                       0, NULL, OPEN_EXISTING, 
+                                       FILE_ATTRIBUTE_NORMAL, NULL);
+        if (testHandle != INVALID_HANDLE_VALUE) {
+            wprintf(L"✅ Connected to: %s\n", devicePaths[i]);
+            if (hControlDevice == INVALID_HANDLE_VALUE) {
+                hControlDevice = testHandle;
+                return TRUE;
+            }
+            CloseHandle(testHandle);
+            return TRUE;
+        }
+        wprintf(L"❌ Failed to connect to %s (Error: %lu)\n", devicePaths[i], GetLastError());
+    }
+    return FALSE;
+}
+
+void RunDiagnostics() {
+    wprintf(L"\n=== SCSI Filter Driver Diagnostics ===\n");
+    
+    // 1. 관리자 권한 확인
+    wprintf(L"1. Checking administrator privileges...\n");
+    if (IsUserAnAdmin()) {
+        wprintf(L"   ✅ Running with administrator privileges\n");
+    } else {
+        wprintf(L"   ⚠️  Not running as administrator\n");
+        wprintf(L"   Some operations may require elevated privileges\n");
+    }
+    
+    // 2. 드라이버 서비스 상태 확인
+    wprintf(L"\n2. Checking driver service status...\n");
+    BOOL driverRunning = CheckDriverStatus();
+    
+    // 3. 디바이스 경로 테스트
+    wprintf(L"\n3. Testing device paths...\n");
+    BOOL deviceAccessible = TryConnectToDriver();
+    
+    // 4. 시스템 정보
+    wprintf(L"\n4. System Information...\n");
+    OSVERSIONINFO osvi;
+    ZeroMemory(&osvi, sizeof(OSVERSIONINFO));
+    osvi.dwOSVersionInfoSize = sizeof(OSVERSIONINFO);
+    if (GetVersionEx(&osvi)) {
+        wprintf(L"   OS Version: %lu.%lu Build %lu\n", 
+                osvi.dwMajorVersion, osvi.dwMinorVersion, osvi.dwBuildNumber);
+    }
+    
+    // 5. 권장사항
+    wprintf(L"\n=== Diagnosis Results ===\n");
+    if (!driverRunning && !deviceAccessible) {
+        wprintf(L"❌ Driver is not installed or not running\n");
+        wprintf(L"💡 Recommendation: Install driver using INF file method\n");
+        wprintf(L"   This ensures proper filter driver registration.\n");
+    } else if (driverRunning && !deviceAccessible) {
+        wprintf(L"⚠️  Driver is running but control device is not accessible\n");
+        wprintf(L"💡 Recommendation: Check driver logs in Event Viewer\n");
+    } else if (!driverRunning && deviceAccessible) {
+        wprintf(L"⚠️  Unexpected state: Device accessible but service not running\n");
+    } else {
+        wprintf(L"✅ Driver appears to be working correctly\n");
+    }
+    
+    wprintf(L"=====================================\n\n");
 }
 
 int wmain() {
@@ -392,14 +965,94 @@ int wmain() {
         return 1;
     }
 
-    // 드라이버의 컨트롤 디바이스에 연결
-    hControlDevice = CreateFileW(L"\\\\.\\SCSITraceControl", 
-                                GENERIC_READ | GENERIC_WRITE, 
-                                0, NULL, OPEN_EXISTING, 
-                                FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hControlDevice == INVALID_HANDLE_VALUE) {
-        fwprintf(stderr, L"Failed to open SCSI trace control device. Error: %lu\n", GetLastError());
-        fwprintf(stderr, L"Make sure the scsi_filter driver is loaded.\n");
+    // 드라이버 상태 확인
+    wprintf(L"\nChecking SCSI Filter driver status...\n");
+    if (!CheckDriverStatus()) {
+        wprintf(L"Driver is not loaded. Please install and start the driver first.\n");
+        wprintf(L"Press [D] to run full diagnostics or see installation guide above.\n");
+        CleanupResources();
+        return 1;
+    }
+
+    // 필터 등록 상태 확인
+    wprintf(L"\nChecking filter registration status...\n");
+    bool filterRegistered = CheckFilterRegistration();
+    
+    if (!filterRegistered) {
+        wprintf(L"\nSCSI 필터가 시스템에 등록되지 않았습니다.\n");
+        wprintf(L"옵션을 선택하세요:\n");
+        wprintf(L"[A] 자동 필터 등록 시도\n");
+        wprintf(L"[M] 수동 설치 가이드 보기\n");
+        wprintf(L"[C] 등록 없이 계속 진행 (제한된 기능)\n");
+        wprintf(L"[Q] 종료\n");
+        wprintf(L"선택: ");
+        
+        wchar_t choice = getwchar();
+        choice = towupper(choice);
+        
+        switch (choice) {
+            case L'A':
+                if (AutoRegisterFilterDriver()) {
+                    wprintf(L"필터 등록이 완료되었습니다. 재부팅 후 다시 실행하세요.\n");
+                } else {
+                    wprintf(L"자동 등록에 실패했습니다. 수동 설치를 시도하세요.\n");
+                    ShowDriverInstallationGuide();
+                }
+                CleanupResources();
+                return 0;
+                
+            case L'M':
+                ShowDriverInstallationGuide();
+                CleanupResources();
+                return 0;
+                
+            case L'C':
+                wprintf(L"등록 없이 계속 진행합니다...\n");
+                break;
+                
+            case L'Q':
+            default:
+                CleanupResources();
+                return 0;
+        }
+    } else {
+        wprintf(L"✓ SCSI 필터가 시스템에 등록되어 있습니다.\n");
+        wprintf(L"옵션을 선택하세요:\n");
+        wprintf(L"[C] 계속 진행\n");
+        wprintf(L"[U] 드라이버 제거\n");
+        wprintf(L"[Q] 종료\n");
+        wprintf(L"선택: ");
+        
+        wchar_t choice = getwchar();
+        choice = towupper(choice);
+        
+        switch (choice) {
+            case L'C':
+                wprintf(L"드라이버와 연결을 진행합니다...\n");
+                break;
+                
+            case L'U':
+                if (UninstallFilterDriver()) {
+                    wprintf(L"드라이버 제거가 완료되었습니다. 재부팅 후 변경사항이 적용됩니다.\n");
+                } else {
+                    wprintf(L"드라이버 제거 중 오류가 발생했습니다. 로그를 확인하세요.\n");
+                }
+                CleanupResources();
+                return 0;
+                
+            case L'Q':
+            default:
+                CleanupResources();
+                return 0;
+        }
+    }
+
+    // 드라이버의 컨트롤 디바이스에 연결 시도
+    wprintf(L"Attempting to connect to SCSI filter driver...\n");
+    
+    if (!TryConnectToDriver()) {
+        fwprintf(stderr, L"Failed to connect to SCSI trace control device.\n");
+        fwprintf(stderr, L"Please run diagnostics ([D] key) for detailed information.\n");
         CleanupResources();
         return 1;
     }
